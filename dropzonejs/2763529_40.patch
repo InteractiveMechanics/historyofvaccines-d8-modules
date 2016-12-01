@@ -1,0 +1,653 @@
+diff --git a/modules/eb_widget/src/Plugin/EntityBrowser/Widget/DropzoneJsEbWidget.php b/modules/eb_widget/src/Plugin/EntityBrowser/Widget/DropzoneJsEbWidget.php
+index a43cefe..f097290 100644
+--- a/modules/eb_widget/src/Plugin/EntityBrowser/Widget/DropzoneJsEbWidget.php
++++ b/modules/eb_widget/src/Plugin/EntityBrowser/Widget/DropzoneJsEbWidget.php
+@@ -1,18 +1,16 @@
+ <?php
+ 
+-/**
+- * Contains \Drupal\dropzonejs_eb_widget\Plugin\EntityBrowser\Widget\DropzoneJsEbWidget.
+- */
+-
+ namespace Drupal\dropzonejs_eb_widget\Plugin\EntityBrowser\Widget;
+ 
+ use Drupal\Component\Utility\Bytes;
+ use Drupal\Component\Utility\NestedArray;
+-use Drupal\Core\Entity\EntityManagerInterface;
++use Drupal\Core\Entity\EntityTypeManagerInterface;
+ use Drupal\Core\Form\FormStateInterface;
+ use Drupal\Core\Session\AccountProxyInterface;
++use Drupal\Core\Utility\Token;
+ use Drupal\dropzonejs\DropzoneJsUploadSaveInterface;
+ use Drupal\entity_browser\WidgetBase;
++use Drupal\entity_browser\WidgetValidationManager;
+ use Symfony\Component\DependencyInjection\ContainerInterface;
+ use Symfony\Component\EventDispatcher\EventDispatcherInterface;
+ 
+@@ -42,6 +40,20 @@ class DropzoneJsEbWidget extends WidgetBase {
+   protected $currentUser;
+ 
+   /**
++   * The token service.
++   *
++   * @var \Drupal\Core\Utility\Token
++   */
++  protected $token;
++
++  /**
++   * Uploaded files.
++   *
++   * @var \Drupal\file\FileInterface[]
++   */
++  protected $files;
++
++  /**
+    * Constructs widget plugin.
+    *
+    * @param array $configuration
+@@ -52,15 +64,22 @@ class DropzoneJsEbWidget extends WidgetBase {
+    *   The plugin implementation definition.
+    * @param \Symfony\Component\EventDispatcher\EventDispatcherInterface $event_dispatcher
+    *   Event dispatcher service.
++   * @param \Drupal\Core\Entity\EntityTypeManagerInterface $entity_type_manager
++   *   The entity type manager service.
++   * @param \Drupal\entity_browser\WidgetValidationManager $validation_manager
++   *   The Widget Validation Manager service.
+    * @param \Drupal\dropzonejs\DropzoneJsUploadSaveInterface $dropzonejs_upload_save
+    *   The upload saving dropzonejs service.
+    * @param \Drupal\Core\Session\AccountProxyInterface $current_user
+    *   The current user service.
++   * @param \Drupal\Core\Utility\Token $token
++   *   The token service.
+    */
+-  public function __construct(array $configuration, $plugin_id, $plugin_definition, EventDispatcherInterface $event_dispatcher, EntityManagerInterface $entity_manager, DropzoneJsUploadSaveInterface $dropzonejs_upload_save, AccountProxyInterface $current_user) {
+-    parent::__construct($configuration, $plugin_id, $plugin_definition, $event_dispatcher, $entity_manager);
++  public function __construct(array $configuration, $plugin_id, $plugin_definition, EventDispatcherInterface $event_dispatcher, EntityTypeManagerInterface $entity_type_manager, WidgetValidationManager $validation_manager, DropzoneJsUploadSaveInterface $dropzonejs_upload_save, AccountProxyInterface $current_user, Token $token) {
++    parent::__construct($configuration, $plugin_id, $plugin_definition, $event_dispatcher, $entity_type_manager, $validation_manager);
+     $this->dropzoneJsUploadSave = $dropzonejs_upload_save;
+     $this->currentUser = $current_user;
++    $this->token = $token;
+   }
+ 
+   /**
+@@ -72,9 +91,11 @@ class DropzoneJsEbWidget extends WidgetBase {
+       $plugin_id,
+       $plugin_definition,
+       $container->get('event_dispatcher'),
+-      $container->get('entity.manager'),
++      $container->get('entity_type.manager'),
++      $container->get('plugin.manager.entity_browser.widget_validation'),
+       $container->get('dropzonejs.upload_save'),
+-      $container->get('current_user')
++      $container->get('current_user'),
++      $container->get('token')
+     );
+   }
+ 
+@@ -93,7 +114,9 @@ class DropzoneJsEbWidget extends WidgetBase {
+   /**
+    * {@inheritdoc}
+    */
+-  public function getForm(array &$original_form, FormStateInterface $form_state, array $aditional_widget_parameters) {
++  public function getForm(array &$original_form, FormStateInterface $form_state, array $additional_widget_parameters) {
++    $form = parent::getForm($original_form, $form_state, $additional_widget_parameters);
++
+     $config = $this->getConfiguration();
+     $form['upload'] = [
+       '#title' => t('File upload'),
+@@ -114,37 +137,85 @@ class DropzoneJsEbWidget extends WidgetBase {
+   /**
+    * {@inheritdoc}
+    */
+-  public function validate(array &$form, FormStateInterface $form_state) {
+-    $upload = $form_state->getValue(['upload'], []);
+-    $trigger = $form_state->getTriggeringElement();
++  public function prepareEntities(array $form, FormStateInterface $form_state) {
++    return $this->getFiles($form, $form_state);
++  }
++
++  /**
++   * Gets uploaded files.
++   *
++   * We implement this to allow child classes to operate on different entity
++   * type while still having access to the files in the validate callback here.
++   *
++   * @param array $form
++   *   Form structure.
++   * @param FormStateInterface $form_state
++   *   Form state object.
++   *
++   * @return \Drupal\file\FileInterface[]
++   *   Array of uploaded files.
++   */
++  protected function getFiles(array $form, FormStateInterface $form_state) {
+     $config = $this->getConfiguration();
++    // @todo Check per user size allowance.
++    $additional_validators = ['file_validate_size' => [Bytes::toInt($config['settings']['max_filesize']), 0]];
++    if (!$this->files) {
++      $this->files = [];
++      foreach ($form_state->getValue(['upload', 'uploaded_files'], []) as $file) {
++        $entity = $this->dropzoneJsUploadSave->saveFile(
++          $file['path'],
++          $this->getUploadLocation(),
++          $config['settings']['extensions'],
++          $this->currentUser,
++          $additional_validators,
++          FALSE
++        );
++        $this->files[] = $entity;
++      }
++    }
+ 
+-    // Validation configuration.
+-    $extensions = $config['settings']['extensions'];
+-    $max_filesize = $config['settings']['max_filesize'];
++    return $this->files;
++  }
++
++  /**
++   * Gets upload location.
++   *
++   * @return string
++   *   Destination folder URI.
++   */
++  protected function getUploadLocation() {
++    return $this->token->replace($this->configuration['upload_location']);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function validate(array &$form, FormStateInterface $form_state) {
++    $trigger = $form_state->getTriggeringElement();
+ 
+     // Validate if we are in fact uploading a files and all of them have the
+     // right extensions. Although DropzoneJS should not even upload those files
+     // it's still better not to rely only on client side validation.
+-    if ($trigger['#value'] == 'Select') {
+-      if (!empty($upload['uploaded_files'])) {
+-        $errors = [];
+-        // @todo Check per user size allowance.
+-        $additional_validators = ['file_validate_size' => [Bytes::toInt($max_filesize), 0]];
+-
+-        foreach ($upload['uploaded_files'] as $file) {
+-          $file = $this->dropzoneJsUploadSave->fileEntityFromUri($file['path'], $this->currentUser);
+-          $errors += $this->dropzoneJsUploadSave->validateFile($file, $extensions, $additional_validators);
+-        }
++    if ($trigger['#type'] == 'submit' && $trigger['#name'] == 'op') {
++      $upload_location = $this->getUploadLocation();
++      if (!file_prepare_directory($upload_location, FILE_CREATE_DIRECTORY | FILE_MODIFY_PERMISSIONS)) {
++        $form_state->setError($form['widget']['upload'], t('Files could not be uploaded because the destination directory %destination is not configured correctly.', ['%destination' => $this->getConfiguration()['settings']['upload_location']]));
++      }
+ 
+-        if (!empty($errors)) {
+-          // @todo Output the actual errors from validateFile.
+-          $form_state->setError($form['widget']['upload'], t('Some files that you are trying to upload did not pass validation. Requirements are: max file %size, allowed extensions are %extensions', ['%size' => $max_filesize, '%extensions' => $extensions]));
+-        }
++      $files = $this->getFiles($form, $form_state);
++      if (in_array(FALSE, $files)) {
++        // @todo Output the actual errors from validateFile.
++        $form_state->setError($form['widget']['upload'], t('Some files that you are trying to upload did not pass validation. Requirements are: max file %size, allowed extensions are %extensions', ['%size' => $this->getConfiguration()['settings']['max_filesize'], '%extensions' => $this->getConfiguration()['settings']['extensions']]));
+       }
+-      else {
++
++      if (empty($files)) {
+         $form_state->setError($form['widget']['upload'], t('At least one valid file should be uploaded.'));
+       }
++
++      // If there weren't any errors set, run the normal validators.
++      if (empty($form_state->getErrors())) {
++        parent::validate($form, $form_state);
++      }
+     }
+   }
+ 
+@@ -153,18 +224,10 @@ class DropzoneJsEbWidget extends WidgetBase {
+    */
+   public function submit(array &$element, array &$form, FormStateInterface $form_state) {
+     $files = [];
+-    $upload = $form_state->getValue('upload');
+-    $config = $this->getConfiguration();
+-    $user = \Drupal::currentUser();
+-
+-    foreach ($upload['uploaded_files'] as $uploaded_file) {
+-      $file = $this->dropzoneJsUploadSave->saveFile($uploaded_file['path'], $config['settings']['upload_location'], $config['settings']['extensions'], $user);
+-
+-      if ($file) {
+-        $file->setPermanent();
+-        $file->save();
+-        $files[] = $file;
+-      }
++    foreach ($this->prepareEntities($form, $form_state) as $file) {
++      $file->setPermanent();
++      $file->save();
++      $files[] = $file;
+     }
+ 
+     if (!empty(array_filter($files))) {
+@@ -215,6 +278,8 @@ class DropzoneJsEbWidget extends WidgetBase {
+    * {@inheritdoc}
+    */
+   public function buildConfigurationForm(array $form, FormStateInterface $form_state) {
++    $form = parent::buildConfigurationForm($form, $form_state);
++
+     $configuration = $this->configuration;
+ 
+     $form['upload_location'] = [
+@@ -279,4 +344,12 @@ class DropzoneJsEbWidget extends WidgetBase {
+     parent::submitConfigurationForm($form, $form_state);
+     $this->configuration['max_filesize'] = $this->configuration['max_filesize'] . 'M';
+   }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function __sleep() {
++    return array_diff(parent::__sleep(), ['files']);
++  }
++
+ }
+diff --git a/modules/eb_widget/src/Plugin/EntityBrowser/Widget/MediaEntityDropzoneJsEbWidget.php b/modules/eb_widget/src/Plugin/EntityBrowser/Widget/MediaEntityDropzoneJsEbWidget.php
+index fa764dd..550da6e 100644
+--- a/modules/eb_widget/src/Plugin/EntityBrowser/Widget/MediaEntityDropzoneJsEbWidget.php
++++ b/modules/eb_widget/src/Plugin/EntityBrowser/Widget/MediaEntityDropzoneJsEbWidget.php
+@@ -1,29 +1,25 @@
+ <?php
+ 
+-/**
+- * Contains \Drupal\dropzonejs_eb_widget\Plugin\EntityBrowser\Widget\MediaEntityDropzoneJsEbWidget.
+- */
+-
+ namespace Drupal\dropzonejs_eb_widget\Plugin\EntityBrowser\Widget;
+ 
+-use Drupal\Component\Utility\Bytes;
+-use Drupal\Component\Utility\NestedArray;
+-use Drupal\Core\Entity\EntityManagerInterface;
+-use Drupal\Core\Entity\EntityStorageInterface;
++use Drupal\Core\Entity\EntityTypeManagerInterface;
+ use Drupal\Core\Extension\ModuleHandlerInterface;
+ use Drupal\Core\Form\FormStateInterface;
+ use Drupal\Core\Link;
+ use Drupal\Core\Session\AccountProxyInterface;
++use Drupal\Core\Utility\Token;
+ use Drupal\dropzonejs\DropzoneJsUploadSaveInterface;
+ use Drupal\dropzonejs\Events\DropzoneMediaEntityCreateEvent;
+ use Drupal\dropzonejs\Events\Events;
+-use Drupal\entity_browser\WidgetBase;
++use Drupal\entity_browser\WidgetValidationManager;
+ use Symfony\Component\DependencyInjection\ContainerInterface;
+ use Symfony\Component\EventDispatcher\EventDispatcherInterface;
+ 
+ /**
+- * Provides an Entity Browser widget that uploads new files and saves media
+- * entities.
++ * Provides an Entity Browser widget that uploads uploads media entities.
++ *
++ * Widget will upload files and attach them to the media entity of bundle that
++ * is defined in the configuration.
+  *
+  * @EntityBrowserWidget(
+  *   id = "dropzonejs_media_entity",
+@@ -41,6 +37,13 @@ class MediaEntityDropzoneJsEbWidget extends DropzoneJsEbWidget {
+   protected $moduleHandler;
+ 
+   /**
++   * Media bundle.
++   *
++   * @var \Drupal\media_entity\MediaBundleInterface
++   */
++  protected $bundle;
++
++  /**
+    * Constructs widget plugin.
+    *
+    * @param array $configuration
+@@ -51,6 +54,10 @@ class MediaEntityDropzoneJsEbWidget extends DropzoneJsEbWidget {
+    *   The plugin implementation definition.
+    * @param \Symfony\Component\EventDispatcher\EventDispatcherInterface $event_dispatcher
+    *   Event dispatcher service.
++   * @param \Drupal\Core\Entity\EntityTypeManagerInterface $entity_type_manager
++   *   The entity type manager service.
++   * @param \Drupal\entity_browser\WidgetValidationManager $validation_manager
++   *   The Widget Validation Manager service.
+    * @param \Drupal\dropzonejs\DropzoneJsUploadSaveInterface $dropzonejs_upload_save
+    *   The upload saving dropzonejs service.
+    * @param \Drupal\Core\Session\AccountProxyInterface $current_user
+@@ -58,8 +65,8 @@ class MediaEntityDropzoneJsEbWidget extends DropzoneJsEbWidget {
+    * @param \Drupal\Core\Extension\ModuleHandlerInterface $module_handler
+    *   The module handler service.
+    */
+-  public function __construct(array $configuration, $plugin_id, $plugin_definition, EventDispatcherInterface $event_dispatcher, EntityManagerInterface $entity_manager, DropzoneJsUploadSaveInterface $dropzonejs_upload_save, AccountProxyInterface $current_user, ModuleHandlerInterface $module_handler) {
+-    parent::__construct($configuration, $plugin_id, $plugin_definition, $event_dispatcher, $entity_manager, $dropzonejs_upload_save, $current_user);
++  public function __construct(array $configuration, $plugin_id, $plugin_definition, EventDispatcherInterface $event_dispatcher, EntityTypeManagerInterface $entity_type_manager, WidgetValidationManager $validation_manager, DropzoneJsUploadSaveInterface $dropzonejs_upload_save, AccountProxyInterface $current_user, Token $token, ModuleHandlerInterface $module_handler) {
++    parent::__construct($configuration, $plugin_id, $plugin_definition, $event_dispatcher, $entity_type_manager, $validation_manager, $dropzonejs_upload_save, $current_user, $token);
+     $this->moduleHandler = $module_handler;
+   }
+ 
+@@ -72,14 +79,15 @@ class MediaEntityDropzoneJsEbWidget extends DropzoneJsEbWidget {
+       $plugin_id,
+       $plugin_definition,
+       $container->get('event_dispatcher'),
+-      $container->get('entity.manager'),
++      $container->get('entity_type.manager'),
++      $container->get('plugin.manager.entity_browser.widget_validation'),
+       $container->get('dropzonejs.upload_save'),
+       $container->get('current_user'),
++      $container->get('token'),
+       $container->get('module_handler')
+     );
+   }
+ 
+-
+   /**
+    * {@inheritdoc}
+    */
+@@ -93,10 +101,16 @@ class MediaEntityDropzoneJsEbWidget extends DropzoneJsEbWidget {
+    * Returns the media bundle that this widget creates.
+    *
+    * @return \Drupal\media_entity\MediaBundleInterface
++   *   Media bundle.
+    */
+   protected function getBundle() {
+-    return $this->entityManager->getStorage('media_bundle')
+-      ->load($this->configuration['media_entity_bundle']);
++    if (!$this->bundle) {
++      $this->bundle = $this->entityTypeManager
++        ->getStorage('media_bundle')
++        ->load($this->configuration['media_entity_bundle']);
++    }
++
++    return $this->bundle;
+   }
+ 
+   /**
+@@ -117,7 +131,7 @@ class MediaEntityDropzoneJsEbWidget extends DropzoneJsEbWidget {
+       $form['media_entity_bundle']['#default_value'] = $bundle->id();
+     }
+ 
+-    $bundles = $this->entityManager->getStorage('media_bundle')->loadMultiple();
++    $bundles = $this->entityTypeManager->getStorage('media_bundle')->loadMultiple();
+ 
+     if (!empty($bundles)) {
+       foreach ($bundles as $bundle) {
+@@ -127,7 +141,7 @@ class MediaEntityDropzoneJsEbWidget extends DropzoneJsEbWidget {
+     else {
+       $form['media_entity_bundle']['#disabled'] = TRUE;
+       $form['media_entity_bundle']['#description'] = $this->t('You must @create_bundle before using this widget.', [
+-        '@create_bundle' => Link::createFromRoute($this->t('create a media bundle'), 'media.bundle_add')->toString()
++        '@create_bundle' => Link::createFromRoute($this->t('create a media bundle'), 'media.bundle_add')->toString(),
+       ]);
+     }
+ 
+@@ -143,6 +157,7 @@ class MediaEntityDropzoneJsEbWidget extends DropzoneJsEbWidget {
+     // Depend on the media bundle this widget creates.
+     $bundle = $this->getBundle();
+     $dependencies[$bundle->getConfigDependencyKey()][] = $bundle->getConfigDependencyName();
++    $dependencies['module'][] = 'media_entity';
+ 
+     return $dependencies;
+   }
+@@ -150,44 +165,35 @@ class MediaEntityDropzoneJsEbWidget extends DropzoneJsEbWidget {
+   /**
+    * {@inheritdoc}
+    */
++  public function prepareEntities(array $form, FormStateInterface $form_state) {
++    $entities = [];
++
++    foreach (parent::prepareEntities($form, $form_state) as $file) {
++      $entities[] = $this->entityTypeManager->getStorage('media')->create([
++        'bundle' => $this->getBundle()->id(),
++        $this->getBundle()->getTypeConfiguration()['source_field'] => $file,
++        'uid' => $this->currentUser->id(),
++        'status' => TRUE,
++        'type' => $this->getBundle()->getType()->getPluginId(),
++      ]);
++    }
++
++    return $entities;
++  }
++
++  /**
++   * {@inheritdoc}
++   */
+   public function submit(array &$element, array &$form, FormStateInterface $form_state) {
+-    $media_entities = [];
+-    $upload = $form_state->getValue('upload');
+-    if (isset($upload['uploaded_files']) && is_array($upload['uploaded_files'])) {
+-
+-      $config = $this->getConfiguration();
+-      $user = $this->currentUser;
+-      $bundle = $this->getBundle();
+-
+-      // First save the file.
+-      foreach ($upload['uploaded_files'] as $uploaded_file) {
+-        $file = $this->dropzoneJsUploadSave->saveFile($uploaded_file['path'], $config['settings']['upload_location'], $config['settings']['extensions'], $user);
+-
+-        if ($file) {
+-          $file->setPermanent();
+-          $file->save();
+-
+-          // Now save the media entity.
+-          if ($this->moduleHandler->moduleExists('media_entity')) {
+-            /** @var \Drupal\media_entity\MediaInterface $media_entity */
+-            $media_entity = $this->entityManager->getStorage('media')->create([
+-              'bundle' => $bundle->id(),
+-              $bundle->getTypeConfiguration()['source_field'] => $file,
+-              'uid' => $user->id(),
+-              'status' => TRUE,
+-              'type' => $bundle->getType()->getPluginId(),
+-            ]);
+-            $event = $this->eventDispatcher->dispatch(Events::MEDIA_ENTITY_CREATE, new DropzoneMediaEntityCreateEvent($media_entity, $file, $form, $form_state, $element));
+-            $media_entity = $event->getMediaEntity();
+-
+-            $media_entity->save();
+-            $media_entities[] = $media_entity;
+-          }
+-          else {
+-            drupal_set_message(t('The media entity was not saved, because the media_entity module is not enabled.'));
+-          }
+-        }
+-      }
++    /** @var \Drupal\media_entity\MediaInterface[] $media_entities */
++    $media_entities = $this->prepareEntities($form, $form_state);
++    $source_field = $this->getBundle()->getTypeConfiguration()['source_field'];
++
++    foreach ($media_entities as &$media_entity) {
++      $file = $media_entity->$source_field->entity;
++      $event = $this->eventDispatcher->dispatch(Events::MEDIA_ENTITY_CREATE, new DropzoneMediaEntityCreateEvent($media_entity, $file, $form, $form_state, $element));
++      $media_entity = $event->getMediaEntity();
++      $media_entity->save();
+     }
+ 
+     if (!empty(array_filter($media_entities))) {
+@@ -195,4 +201,12 @@ class MediaEntityDropzoneJsEbWidget extends DropzoneJsEbWidget {
+       $this->clearFormValues($element, $form_state);
+     }
+   }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function __sleep() {
++    return array_diff(parent::__sleep(), ['bundle']);
++  }
++
+ }
+diff --git a/src/DropzoneJsUploadSave.php b/src/DropzoneJsUploadSave.php
+index 38e4230..64dba0f 100644
+--- a/src/DropzoneJsUploadSave.php
++++ b/src/DropzoneJsUploadSave.php
+@@ -1,10 +1,5 @@
+ <?php
+ 
+-/**
+- * @file
+- * Contains \Drupal\dropzonejs\DropzoneJsUploadSave.
+- */
+-
+ namespace Drupal\dropzonejs;
+ 
+ use Drupal\Component\Render\PlainTextOutput;
+@@ -16,12 +11,10 @@ use Drupal\Core\Session\AccountProxyInterface;
+ use Drupal\Core\Utility\Token;
+ use Drupal\file\FileInterface;
+ use Symfony\Component\HttpFoundation\File\MimeType\MimeTypeGuesserInterface;
+-use Symfony\Component\Validator\Constraints\File;
+ use Drupal\Core\File\FileSystemInterface;
+ 
+ /**
+- * A service that saves files uploaded by the dropzonejs element as file
+- * entities.
++ * A service that saves files uploaded by the dropzonejs element as files.
+  *
+  * Most of this file mimics or directly copies what core does. For more
+  * information and comments see file_save_upload().
+@@ -108,7 +101,7 @@ class DropzoneJsUploadSave implements DropzoneJsUploadSaveInterface {
+   /**
+    * {@inheritdoc}
+    */
+-  public function saveFile($uri, $destination, $extensions, AccountProxyInterface $user, $validators = []) {
++  public function saveFile($uri, $destination, $extensions, AccountProxyInterface $user, $validators = [], $save_file = TRUE) {
+     // Create the file entity.
+     $file = $this->fileEntityFromUri($uri, $user);
+ 
+@@ -159,14 +152,24 @@ class DropzoneJsUploadSave implements DropzoneJsUploadSaveInterface {
+     $this->fileSystem->chmod($file->getFileUri());
+ 
+     // If we made it this far it's safe to record this file in the database.
+-    $file->save();
++    if ($save_file) {
++      $file->save();
++    }
+     return $file;
+   }
+ 
+   /**
+-   * {@inheritdoc}
++   * Prepare a file entity from uri.
++   *
++   * @param string $uri
++   *   File's uri.
++   * @param \Drupal\Core\Session\AccountProxyInterface $user
++   *   The owner of the file.
++   *
++   * @return \Drupal\file\FileInterface
++   *   A new entity file entity object, not saved yet.
+    */
+-  public function fileEntityFromUri($uri, AccountProxyInterface $user) {
++  protected function fileEntityFromUri($uri, AccountProxyInterface $user) {
+     $uri = file_stream_wrapper_uri_normalize($uri);
+     $file_info = new \SplFileInfo($uri);
+ 
+@@ -219,7 +222,6 @@ class DropzoneJsUploadSave implements DropzoneJsUploadSaveInterface {
+     return FALSE;
+   }
+ 
+-
+   /**
+    * Validate and set destination the destination URI.
+    *
+diff --git a/src/DropzoneJsUploadSaveInterface.php b/src/DropzoneJsUploadSaveInterface.php
+index 8401e5f..bc47c08 100644
+--- a/src/DropzoneJsUploadSaveInterface.php
++++ b/src/DropzoneJsUploadSaveInterface.php
+@@ -1,10 +1,5 @@
+ <?php
+ 
+-/**
+- * @file
+- * Contains \Drupal\dropzonejs\DropzoneJsUploadSaveInterface.
+- */
+-
+ namespace Drupal\dropzonejs;
+ 
+ use Drupal\Core\Session\AccountProxyInterface;
+@@ -27,32 +22,21 @@ interface DropzoneJsUploadSaveInterface {
+    *   be a stream wrapper URI.
+    * @param string $extensions
+    *   A space separated list of valid extensions.
+-   * @param \Drupal\Core\Session\AccountProxyInterfac $user
++   * @param \Drupal\Core\Session\AccountProxyInterface $user
+    *   The owner of the file.
+    * @param array $validators
+-   *   An optional, associative array of callback functions used to validate the
++   *   (Optional) Associative array of callback functions used to validate the
+    *   file. See file_validate() for more documentation. Note that we add
+    *   file_validate_extensions and file_validate_name_length in this method
+    *   already.
++   * @param bool $save_file
++   *   (Optional) Flag that prevents file from being saved if set to FALSE.
+    *
+    * @return \Drupal\file\FileInterface|bool
+    *   The saved file entity of the newly created file entity or false if
+    *   saving failed.
+    */
+-  public function saveFile($uri, $destination, $extensions, AccountProxyInterface $user, $validators = []);
+-
+-  /**
+-   * Prepare a file entity from uri.
+-   *
+-   * @param string $uri
+-   *   File's uri.
+-   * @param \Drupal\Core\Session\AccountProxyInterface $user
+-   *   The owner of the file.
+-   *
+-   * @return \Drupal\file\FileInterface
+-   *   A new entity file entity object, not saved yet.
+-   */
+-  public function fileEntityFromUri($uri, AccountProxyInterface $user);
++  public function saveFile($uri, $destination, $extensions, AccountProxyInterface $user, $validators = [], $save_file = TRUE);
+ 
+   /**
+    * Validate the uploaded file.
+@@ -71,4 +55,5 @@ interface DropzoneJsUploadSaveInterface {
+    *   An array containing validation error messages.
+    */
+   public function validateFile(FileInterface $file, $extensions, array $additional_validators = []);
++
+ }
+diff --git a/src/UploadHandler.php b/src/UploadHandler.php
+index c00bc63..e3d5cd7 100644
+--- a/src/UploadHandler.php
++++ b/src/UploadHandler.php
+@@ -1,10 +1,5 @@
+ <?php
+ 
+-/**
+- * @file
+- * Contains \Drupal\dropzonejs\UploadHandler.
+- */
+-
+ namespace Drupal\dropzonejs;
+ 
+ use Drupal\Component\Transliteration\TransliterationInterface;
+@@ -55,7 +50,7 @@ class UploadHandler implements UploadHandlerInterface {
+    *   The request stack.
+    * @param \Drupal\Core\Config\ConfigFactoryInterface $config
+    *   Config factory.
+-   * @param \Drupal\Core\Transliteration\PhpTransliteration $transliteration
++   * @param \Drupal\Component\Transliteration\TransliterationInterface $transliteration
+    *   Transliteration service.
+    */
+   public function __construct(RequestStack $request_stack, ConfigFactoryInterface $config, TransliterationInterface $transliteration) {
+@@ -68,9 +63,6 @@ class UploadHandler implements UploadHandlerInterface {
+   /**
+    * Prepares temporary destination folder for uploaded files.
+    *
+-   * @return bool
+-   *   TRUE if destination folder looks OK and FALSE otherwise.
+-   *
+    * @throws \Drupal\dropzonejs\UploadException
+    */
+   protected function prepareTemporaryUploadDestination() {
+@@ -154,7 +146,9 @@ class UploadHandler implements UploadHandlerInterface {
+       fwrite($out, $buff);
+     }
+ 
+-    // Be nice and keep everything nice and clean.
++    // Be nice and keep everything nice and clean. Initial uploaded files are
++    // automatically removed by PHP at the end of the request so we don't need
++    // to do that.
+     // @todo when implementing multipart don't forget to drupal_unlink.
+     fclose($in);
+     fclose($out);
